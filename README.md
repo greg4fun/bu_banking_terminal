@@ -7,13 +7,17 @@ Linux, and Windows with the same script.
 ## Quickstart
 
 ```bash
-# 1. Install the only dependency
+# 1. Create and activate a virtualenv
+python3 -m venv venv
+source venv/bin/activate           # Windows: venv\Scripts\activate
+
+# 2. Install the only dependency
 pip install -r requirements.txt
 
-# 2. Run
+# 3. Run
 python local-terminal.py
 
-# 3. Open the UI (same machine)
+# 4. Open the UI (same machine)
 #    http://localhost:47823
 ```
 
