@@ -50,6 +50,7 @@ import base64
 import http.server
 import json
 import os
+import re
 import socketserver
 import sys
 import time
@@ -94,6 +95,34 @@ def _read_block(connection, block: int) -> bytes:
     if (sw1, sw2) != (0x90, 0x00):
         raise IOError(f"block {block}: status {sw1:02X}{sw2:02X}")
     return bytes(data)
+
+
+def _write_block(connection, block: int, data: bytes) -> None:
+    if len(data) != 4:
+        raise ValueError("NTAG block write must be exactly 4 bytes")
+    cmd = [0xFF, 0xD6, 0x00, block, 0x04] + list(data)
+    _, sw1, sw2 = connection.transmit(cmd)
+    if (sw1, sw2) != (0x90, 0x00):
+        raise IOError(f"block {block}: status {sw1:02X}{sw2:02X}")
+
+
+def _build_ndef_text_payload(text: str) -> bytes:
+    """Build an NDEF Text record wrapped in TLV, padded to 4-byte blocks."""
+    body = text.encode("utf-8")
+    lang = b"en"
+    # Text record payload: status byte (UTF-8, lang length in low bits) + lang + text
+    payload = bytes([len(lang) & 0x3F]) + lang + body
+    type_field = b"T"
+    # Record header: MB=1 ME=1 CF=0 SR=1 IL=0 TNF=001 (well-known)
+    if len(payload) > 255:
+        raise ValueError("payload too large for short record")
+    record = bytes([0xD1, len(type_field), len(payload)]) + type_field + payload
+    if len(record) < 0xFF:
+        tlv = bytes([0x03, len(record)]) + record + bytes([0xFE])
+    else:
+        tlv = bytes([0x03, 0xFF, (len(record) >> 8) & 0xFF, len(record) & 0xFF]) + record + bytes([0xFE])
+    pad = (-len(tlv)) % 4
+    return tlv + b"\x00" * pad
 
 
 def _walk_ndef_text(raw: bytes) -> Optional[str]:
@@ -166,6 +195,51 @@ def wait_for_tap(timeout: float) -> Tuple[Optional[str], Optional[str]]:
             return None, f"no NDEF text record on tag {toHexString(atr)}"
         except (NoCardException, CardConnectionException):
             time.sleep(0.4)
+    return None, "no card tapped within timeout"
+
+
+def wait_for_program(text: str, timeout: float) -> Tuple[Optional[str], Optional[str]]:
+    """Block until a card is tapped, then write `text` as an NDEF Text record.
+
+    Returns (verified_text, error). On success `verified_text` is what we
+    re-read from the tag after writing.
+    """
+    rs = list_readers_safe()
+    if not rs:
+        return None, "no PC/SC reader connected"
+    idx = SELECTED_READER_INDEX if 0 <= SELECTED_READER_INDEX < len(rs) else 0
+    r = rs[idx]
+    try:
+        ndef = _build_ndef_text_payload(text)
+    except ValueError as e:
+        return None, f"payload error: {e}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            c = r.createConnection()
+            c.connect(CardConnection.T1_protocol)
+            try:
+                atr = c.getATR()
+                # Write 4-byte blocks starting at block 4 (NTAG2xx user memory).
+                for i in range(0, len(ndef), 4):
+                    _write_block(c, 4 + i // 4, ndef[i:i + 4])
+                # Read back to verify.
+                raw = bytearray()
+                for blk in range(4, 4 + (len(ndef) // 4) + 4):
+                    try:
+                        raw.extend(_read_block(c, blk))
+                    except IOError:
+                        break
+                verified = _walk_ndef_text(bytes(raw))
+            finally:
+                c.disconnect()
+            if verified is None:
+                return None, f"wrote tag {toHexString(atr)} but could not verify NDEF read-back"
+            return verified, None
+        except (NoCardException, CardConnectionException):
+            time.sleep(0.4)
+        except IOError as e:
+            return None, f"write failed: {e}"
     return None, "no card tapped within timeout"
 
 
@@ -247,7 +321,10 @@ HTML = """<!doctype html>
 </style></head><body>
 <header>
   <h1>Local NFC Terminal</h1>
-  <small id="cfg">localhost</small>
+  <div style="display:flex;gap:12px;align-items:center">
+    <a href="#" onclick="openProgram();return false" style="color:var(--accent);font-size:12px;text-decoration:none">Program card →</a>
+    <small id="cfg">localhost</small>
+  </div>
 </header>
 <main>
   <div class="amount-display"><small>£</small><span id="amount">0.00</span></div>
@@ -275,6 +352,7 @@ HTML = """<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 let amount = 0;
+function openProgram(){ window.open('/program', 'program-card', 'width=460,height=620'); }
 function render(){ $('amount').textContent = (amount/100).toFixed(2); }
 document.querySelectorAll('.key').forEach(k => k.addEventListener('click', () => {
   const v = k.dataset.key;
@@ -360,6 +438,94 @@ loadReaders();
 """
 
 
+PROGRAM_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Program card</title>
+<style>
+  :root { --bg:#0b1020; --card:#141a30; --accent:#5eead4; --muted:#94a3b8; --good:#22c55e; --bad:#ef4444; --warn:#fbbf24; --text:#e5e7eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; min-height:100vh; }
+  header { padding:12px 20px; background:#0f1630; border-bottom:1px solid #1f2747; }
+  header h1 { margin:0; font-size:14px; letter-spacing:.5px; font-weight:500; }
+  main { padding:20px; max-width:460px; margin:0 auto; display:flex; flex-direction:column; gap:14px; }
+  label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; letter-spacing:.3px; text-transform:uppercase; }
+  input, select, button { font:inherit; border-radius:8px; border:1px solid #1f2747; background:var(--card); color:var(--text); padding:10px 12px; width:100%; }
+  input.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .preview { background:#0f1630; border:1px dashed #1f2747; border-radius:8px; padding:10px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; color:var(--muted); word-break:break-all; }
+  button.primary { background:var(--accent); color:#0b1020; border:none; cursor:pointer; padding:14px; font-weight:600; font-size:15px; }
+  button.primary:disabled { opacity:.5; cursor:not-allowed; }
+  .status { padding:14px; border-radius:12px; text-align:center; font-size:14px; display:none; }
+  .status.show { display:block; }
+  .status.waiting  { background:#1f1a0e; color:var(--warn); border:1px solid var(--warn); }
+  .status.ok       { background:#0a2b2a; color:var(--good); border:1px solid var(--good); font-weight:600; }
+  .status.err      { background:#2b0a0a; color:var(--bad);  border:1px solid var(--bad);  font-weight:600; }
+  .status small { display:block; margin-top:4px; font-size:11px; color:var(--muted); font-weight:400; word-break:break-all; }
+  .help { font-size:11px; color:var(--muted); margin-top:4px; }
+</style></head><body>
+<header><h1>Program card</h1></header>
+<main>
+  <div>
+    <label for="bank">Bank ID</label>
+    <input id="bank" class="mono" placeholder="29329eb1-4fc0-4db4-bd92-debdb81f81c6" autocomplete="off" spellcheck="false">
+    <div class="help">Paste the issuing bank's UUID.</div>
+  </div>
+  <div>
+    <label for="acct">Account number</label>
+    <input id="acct" class="mono" placeholder="0000000000000001" autocomplete="off" inputmode="numeric" maxlength="16">
+    <div class="help">16-digit account number.</div>
+  </div>
+  <div>
+    <label>Will write</label>
+    <div class="preview" id="preview">—</div>
+  </div>
+  <button class="primary" id="write" onclick="program()">Tap card to write</button>
+  <div id="status" class="status"></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+function escape(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function setStatus(kind, html){ const s = $('status'); s.className = 'status' + (kind ? ' show '+kind : ''); s.innerHTML = html; }
+function refreshPreview(){
+  const b = $('bank').value.trim();
+  const a = $('acct').value.trim();
+  $('preview').textContent = (b && a) ? (b + '|' + a) : '—';
+}
+$('bank').addEventListener('input', refreshPreview);
+$('acct').addEventListener('input', refreshPreview);
+
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+async function program(){
+  const bank = $('bank').value.trim();
+  const acct = $('acct').value.trim();
+  if (!UUID_RE.test(bank)){ setStatus('err', 'Bank ID must be a UUID'); return; }
+  if (!/^\\d{1,16}$/.test(acct)){ setStatus('err', 'Account number must be up to 16 digits'); return; }
+  const padded = acct.padStart(16, '0');
+  $('write').disabled = true;
+  setStatus('waiting', 'Tap a card on the reader to write…<br><small>' + escape(bank + '|' + padded) + '</small>');
+  try {
+    const r = await fetch('/program', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({bank_id: bank, account_number: padded})
+    });
+    const body = await r.json();
+    if (!r.ok) {
+      setStatus('err', 'Write failed<br><small>' + escape(body.error || r.status) + '</small>');
+      return;
+    }
+    setStatus('ok', 'Card programmed<br><small>verified: ' + escape(body.verified || '') + '</small>');
+  } catch (e) {
+    setStatus('err', 'Local error<br><small>' + escape(e.message) + '</small>');
+  } finally {
+    $('write').disabled = false;
+  }
+}
+refreshPreview();
+</script></body></html>
+"""
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # noqa: ARG002
         # Mute the default access log; print taps explicitly instead.
@@ -376,6 +542,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
         if self.path == "/":
             data = HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == "/program":
+            data = PROGRAM_HTML.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -406,6 +579,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             SELECTED_READER_INDEX = idx
             print(f"[reader] selected #{idx}: {rs[idx]}")
             self._reply(200, {"selected": idx, "name": str(rs[idx])})
+            return
+
+        if self.path == "/program":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length).decode() or "{}")
+            except json.JSONDecodeError:
+                self._reply(400, {"error": "invalid json"})
+                return
+            bank_id = (body.get("bank_id") or "").strip()
+            account_number = (body.get("account_number") or "").strip()
+            if not re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", bank_id):
+                self._reply(400, {"error": "bank_id must be a UUID"})
+                return
+            if not re.match(r"^\d{1,16}$", account_number):
+                self._reply(400, {"error": "account_number must be up to 16 digits"})
+                return
+            account_number = account_number.zfill(16)
+            payload = f"{bank_id}|{account_number}"
+            print(f"[program] arming reader, payload={payload} ...")
+            verified, err = wait_for_program(payload, TAP_TIMEOUT)
+            if err:
+                print(f"[program] failed: {err}")
+                self._reply(400, {"error": err})
+                return
+            print(f"[program] wrote and verified: {verified}")
+            self._reply(200, {"verified": verified, "payload": payload})
             return
 
         if self.path != "/charge":
