@@ -5,9 +5,14 @@ local-terminal.py — self-contained POS terminal for the payment-network lab.
 Single-file Python app. Runs an HTTP server on localhost (default port 47823)
 that serves a POS-style page. When you click "Tap card", the server arms a
 USB NFC reader via PC/SC, waits up to 30 s for a card, reads the NDEF text
-payload (<bank_id>|<card_number>), and POSTs the charge through
-bu-banking-cf's /api/terminal/charge endpoint, which forwards into the
-payment network with the instructor bank's stored api_key.
+payload (<bank_id>|<card_number>), and POSTs the charge directly to the v2
+payment network's /api/authorize endpoint with the terminal's acquirer
+X-API-Key.
+
+The Program-card flow first registers the card on the issuing bank via
+POST /api/cards/register (v2 has no auto-issue) and then writes the tag.
+Bank IDs and issuer API keys are persisted to ~/.bu-banking-terminal/
+config.json so they survive restarts.
 
 No WebUSB, no Zadig, no keyboard wedge, no extra services. Works with any
 PC/SC reader pyscard can see (ACR122U, ACR1252U, NC001, etc.) on any OS
@@ -30,23 +35,23 @@ with a PC/SC stack — that means macOS, Linux, and Windows.
 
 ================================ CONFIG ====================================
 
-  Environment variables (all optional):
-    TERMINAL_URL   POST target. Default: https://bu-banking-cf.pages.dev/api/terminal/charge
-    ADMIN_KEY      Basic-Auth password for the terminal endpoint.
-                   Default: "dupachuj" (the lab's current admin key).
-    PORT           HTTP listen port. Default: 47823.
-    TAP_TIMEOUT    Seconds to wait for a card after Tap. Default: 30.
+  Environment variables:
+    PAYMENT_NETWORK_URL  v2 network base URL.
+                         Default: https://paymentsystem-cards-cf.pages.dev
+    ACQUIRER_API_KEY     X-API-Key for the acquiring bank used on /api/authorize.
+                         Required for charges to succeed.
+    PORT                 HTTP listen port. Default: 47823.
+    TAP_TIMEOUT          Seconds to wait for a card after Tap. Default: 30.
 
 ================================  RUN  =====================================
 
-    python local-terminal.py
+    ACQUIRER_API_KEY=sk_... python local-terminal.py
 
   Then open http://localhost:47823 in any browser on the same machine.
   Pick a reader from the dropdown, type an amount, hit Tap card.
 """
 from __future__ import annotations
 
-import base64
 import http.server
 import json
 import os
@@ -77,15 +82,42 @@ except ImportError:
     sys.exit(1)
 
 
-TERMINAL_URL = os.environ.get(
-    "TERMINAL_URL",
-    "https://bu-banking-cf.pages.dev/api/terminal/charge",
-)
-# Fall back to "dupachuj" (the lab's current admin key) when the env var
-# isn't propagated; saves a debugging round-trip if the launcher quirks.
-ADMIN_KEY = os.environ.get("ADMIN_KEY") or "dupachuj"
+PAYMENT_NETWORK_URL = os.environ.get(
+    "PAYMENT_NETWORK_URL",
+    "https://paymentsystem-cards-cf.pages.dev",
+).rstrip("/")
 LISTEN_PORT = int(os.environ.get("PORT", "47823"))
 TAP_TIMEOUT = float(os.environ.get("TAP_TIMEOUT", "30"))
+
+AUTHORIZE_URL = PAYMENT_NETWORK_URL + "/api/authorize"
+REGISTER_CARD_URL = PAYMENT_NETWORK_URL + "/api/cards/register"
+
+CONFIG_PATH = os.path.expanduser("~/.bu-banking-terminal/config.json")
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def current_acquirer_api_key() -> str:
+    """Settings UI takes precedence; ACQUIRER_API_KEY env var is the seed."""
+    val = load_config().get("acquirer_api_key")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return os.environ.get("ACQUIRER_API_KEY") or ""
 
 
 # ---------- NFC plumbing -------------------------------------------------
@@ -265,12 +297,12 @@ def _post_charge(amount: float, merchant_id: str, payload: str) -> Tuple[int, di
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 ps-local-terminal/1.0",
     }
-    if ADMIN_KEY:
-        token = base64.b64encode(f"x:{ADMIN_KEY}".encode()).decode()
-        headers["Authorization"] = f"Basic {token}"
+    api_key = current_acquirer_api_key()
+    if api_key:
+        headers["X-API-Key"] = api_key
 
-    req = urllib.request.Request(TERMINAL_URL, data=body, headers=headers, method="POST")
-    print(f"[charge] POST {TERMINAL_URL} (auth={'set' if ADMIN_KEY else 'unset'})")
+    req = urllib.request.Request(AUTHORIZE_URL, data=body, headers=headers, method="POST")
+    print(f"[charge] POST {AUTHORIZE_URL} (api-key={'set' if api_key else 'unset'})")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.status, json.loads(resp.read() or b"{}")
@@ -282,7 +314,55 @@ def _post_charge(amount: float, merchant_id: str, payload: str) -> Tuple[int, di
             return e.code, {
                 "error": str(e),
                 "body": raw.decode("utf-8", errors="replace")[:300],
-                "auth_sent": bool(ADMIN_KEY),
+                "api_key_sent": bool(api_key),
+            }
+    except Exception as e:
+        return 502, {"error": f"network error: {e}"}
+
+
+def _whoami_on_network(api_key: str) -> Tuple[int, dict]:
+    """GET /api/banks/me to find which bank an api_key belongs to."""
+    headers = {
+        "X-API-Key": api_key,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 ps-local-terminal/1.0",
+    }
+    req = urllib.request.Request(PAYMENT_NETWORK_URL + "/api/banks/me", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read() or b""
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {"error": str(e), "body": raw.decode("utf-8", errors="replace")[:300]}
+    except Exception as e:
+        return 502, {"error": f"network error: {e}"}
+
+
+def _register_card_on_network(issuer_api_key: str, card_number: str, amount: float) -> Tuple[int, dict]:
+    """POST /api/cards/register on v2. Returns (status, body)."""
+    body = json.dumps({"card_number": card_number, "amount": amount}).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": issuer_api_key,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 ps-local-terminal/1.0",
+    }
+    req = urllib.request.Request(REGISTER_CARD_URL, data=body, headers=headers, method="POST")
+    print(f"[program] register POST {REGISTER_CARD_URL} card={card_number} amount={amount}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read() or b""
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {
+                "error": str(e),
+                "body": raw.decode("utf-8", errors="replace")[:300],
             }
     except Exception as e:
         return 502, {"error": f"network error: {e}"}
@@ -322,7 +402,8 @@ HTML = """<!doctype html>
 <header>
   <h1>Local NFC Terminal</h1>
   <div style="display:flex;gap:12px;align-items:center">
-    <a href="#" onclick="openProgram();return false" style="color:var(--accent);font-size:12px;text-decoration:none">Program card →</a>
+    <a href="/program" style="color:var(--accent);font-size:12px;text-decoration:none">Program card →</a>
+    <a href="/config" style="color:var(--accent);font-size:12px;text-decoration:none">Settings →</a>
     <small id="cfg">localhost</small>
   </div>
 </header>
@@ -352,7 +433,6 @@ HTML = """<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 let amount = 0;
-function openProgram(){ window.open('/program', 'program-card', 'width=460,height=620'); }
 function render(){ $('amount').textContent = (amount/100).toFixed(2); }
 document.querySelectorAll('.key').forEach(k => k.addEventListener('click', () => {
   const v = k.dataset.key;
@@ -445,8 +525,9 @@ PROGRAM_HTML = """<!doctype html>
   :root { --bg:#0b1020; --card:#141a30; --accent:#5eead4; --muted:#94a3b8; --good:#22c55e; --bad:#ef4444; --warn:#fbbf24; --text:#e5e7eb; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; min-height:100vh; }
-  header { padding:12px 20px; background:#0f1630; border-bottom:1px solid #1f2747; }
+  header { padding:12px 20px; background:#0f1630; border-bottom:1px solid #1f2747; display:flex; align-items:center; justify-content:space-between; gap:12px; }
   header h1 { margin:0; font-size:14px; letter-spacing:.5px; font-weight:500; }
+  header a { color:var(--accent); font-size:12px; text-decoration:none; }
   main { padding:20px; max-width:460px; margin:0 auto; display:flex; flex-direction:column; gap:14px; }
   label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; letter-spacing:.3px; text-transform:uppercase; }
   input, select, button { font:inherit; border-radius:8px; border:1px solid #1f2747; background:var(--card); color:var(--text); padding:10px 12px; width:100%; }
@@ -462,23 +543,33 @@ PROGRAM_HTML = """<!doctype html>
   .status small { display:block; margin-top:4px; font-size:11px; color:var(--muted); font-weight:400; word-break:break-all; }
   .help { font-size:11px; color:var(--muted); margin-top:4px; }
 </style></head><body>
-<header><h1>Program card</h1></header>
+<header><a href="/">← Terminal</a><h1>Program card</h1><span style="width:60px"></span></header>
 <main>
   <div>
-    <label for="bank">Bank ID</label>
-    <input id="bank" class="mono" placeholder="29329eb1-4fc0-4db4-bd92-debdb81f81c6" autocomplete="off" spellcheck="false">
-    <div class="help">Paste the issuing bank's UUID.</div>
+    <label for="bank">Bank ID  <span style="text-transform:none;letter-spacing:0;color:var(--accent)">— or paste bank|card</span></label>
+    <input id="bank" class="mono" placeholder="29329eb1-4fc0-4db4-bd92-debdb81f81c6  or  &lt;bank&gt;|&lt;card&gt;" autocomplete="off" spellcheck="false">
+    <div class="help">Paste the issuing bank's UUID. If you paste <code>bank|card</code>, it auto-splits.</div>
   </div>
   <div>
-    <label for="acct">Account number</label>
+    <label for="acct">Card number</label>
     <input id="acct" class="mono" placeholder="0000000000000001" autocomplete="off" inputmode="numeric" maxlength="16">
-    <div class="help">16-digit account number.</div>
+    <div class="help">Exactly 16 digits (will be left-padded with zeros).</div>
+  </div>
+  <div>
+    <label for="api_key">Issuer API key (X-API-Key)</label>
+    <input id="api_key" class="mono" type="password" placeholder="sk_..." autocomplete="off" spellcheck="false">
+    <div class="help">The issuing bank's api_key. Used to register the card on v2 before writing the tag. Cached per bank in <code>~/.bu-banking-terminal/config.json</code>.</div>
+  </div>
+  <div>
+    <label for="amount">Card balance (£, max 10)</label>
+    <input id="amount" type="number" min="0.01" max="10" step="0.01" value="10">
+    <div class="help">Amount loaded onto the card on the issuing bank.</div>
   </div>
   <div>
     <label>Will write</label>
     <div class="preview" id="preview">—</div>
   </div>
-  <button class="primary" id="write" onclick="program()">Tap card to write</button>
+  <button class="primary" id="write" onclick="program()">Register + tap card to write</button>
   <div id="status" class="status"></div>
 </main>
 <script>
@@ -490,38 +581,170 @@ function refreshPreview(){
   const a = $('acct').value.trim();
   $('preview').textContent = (b && a) ? (b + '|' + a) : '—';
 }
-$('bank').addEventListener('input', refreshPreview);
+
+let issuerKeys = {};   // bank_id -> api_key, populated from /program/state
+let lastBank = '';     // last bank-id we synced the api_key field against
+
+function maybeSplitBankCard(){
+  const v = $('bank').value;
+  const idx = v.indexOf('|');
+  if (idx >= 0) {
+    const left = v.slice(0, idx).trim();
+    const right = v.slice(idx + 1).trim();
+    $('bank').value = left;
+    if (right) $('acct').value = right.replace(/\\D/g, '').slice(0, 16);
+  }
+  // When the bank changes, sync the api_key field: pre-fill from cache or
+  // clear, so we never carry over the previous bank's key.
+  const b = $('bank').value.trim();
+  if (b !== lastBank) {
+    $('api_key').value = (b && issuerKeys[b]) ? issuerKeys[b] : '';
+    lastBank = b;
+  }
+  refreshPreview();
+}
+
+$('bank').addEventListener('input', maybeSplitBankCard);
 $('acct').addEventListener('input', refreshPreview);
 
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
+async function loadState(){
+  try {
+    const r = await fetch('/program/state');
+    if (!r.ok) return;
+    const s = await r.json();
+    issuerKeys = s.issuer_api_keys || {};
+    if (s.last_bank_id) $('bank').value = s.last_bank_id;
+    if (s.default_amount) $('amount').value = s.default_amount;
+    const b = $('bank').value.trim();
+    if (b && issuerKeys[b]) $('api_key').value = issuerKeys[b];
+    lastBank = b;
+    refreshPreview();
+  } catch (e) { /* ignore */ }
+}
+
 async function program(){
   const bank = $('bank').value.trim();
   const acct = $('acct').value.trim();
+  const apiKey = $('api_key').value.trim();
+  const amount = parseFloat($('amount').value);
   if (!UUID_RE.test(bank)){ setStatus('err', 'Bank ID must be a UUID'); return; }
-  if (!/^\\d{1,16}$/.test(acct)){ setStatus('err', 'Account number must be up to 16 digits'); return; }
+  if (!/^\\d{1,16}$/.test(acct)){ setStatus('err', 'Card number must be up to 16 digits'); return; }
+  if (!apiKey){ setStatus('err', 'Issuer API key is required to register the card on v2'); return; }
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 10){ setStatus('err', 'Amount must be £0.01–£10'); return; }
   const padded = acct.padStart(16, '0');
   $('write').disabled = true;
-  setStatus('waiting', 'Tap a card on the reader to write…<br><small>' + escape(bank + '|' + padded) + '</small>');
+  setStatus('waiting', 'Registering on v2, then tap a card to write…<br><small>' + escape(bank + '|' + padded) + ' · £' + amount.toFixed(2) + '</small>');
   try {
     const r = await fetch('/program', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({bank_id: bank, account_number: padded})
+      body: JSON.stringify({bank_id: bank, account_number: padded, issuer_api_key: apiKey, amount: amount})
     });
     const body = await r.json();
     if (!r.ok) {
-      setStatus('err', 'Write failed<br><small>' + escape(body.error || r.status) + '</small>');
+      const where = body.stage ? ' (' + escape(body.stage) + ')' : '';
+      setStatus('err', 'Failed' + where + '<br><small>' + escape(body.error || r.status) + '</small>');
       return;
     }
-    setStatus('ok', 'Card programmed<br><small>verified: ' + escape(body.verified || '') + '</small>');
+    const note = body.registration && body.registration.already ? ' (card was already registered)' : '';
+    setStatus('ok', 'Card programmed' + note + '<br><small>verified: ' + escape(body.verified || '') + '</small>');
   } catch (e) {
     setStatus('err', 'Local error<br><small>' + escape(e.message) + '</small>');
   } finally {
     $('write').disabled = false;
   }
 }
-refreshPreview();
+loadState();
+</script></body></html>
+"""
+
+
+CONFIG_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings</title>
+<style>
+  :root { --bg:#0b1020; --card:#141a30; --accent:#5eead4; --muted:#94a3b8; --good:#22c55e; --bad:#ef4444; --warn:#fbbf24; --text:#e5e7eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; min-height:100vh; }
+  header { padding:12px 20px; background:#0f1630; border-bottom:1px solid #1f2747; display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  header h1 { margin:0; font-size:14px; letter-spacing:.5px; font-weight:500; }
+  header a { color:var(--accent); font-size:12px; text-decoration:none; }
+  main { padding:20px; max-width:560px; margin:0 auto; display:flex; flex-direction:column; gap:14px; }
+  label { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; letter-spacing:.3px; text-transform:uppercase; }
+  input, button { font:inherit; border-radius:8px; border:1px solid #1f2747; background:var(--card); color:var(--text); padding:10px 12px; width:100%; }
+  input.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  button.primary { background:var(--accent); color:#0b1020; border:none; cursor:pointer; padding:14px; font-weight:600; font-size:15px; }
+  button.ghost { background:var(--card); color:var(--muted); border:1px solid #1f2747; cursor:pointer; padding:14px; }
+  .help { font-size:11px; color:var(--muted); margin-top:4px; }
+  .help code { background:#0f1630; padding:1px 5px; border-radius:3px; }
+  .status { padding:14px; border-radius:12px; text-align:center; font-size:14px; display:none; }
+  .status.show { display:block; }
+  .status.ok  { background:#0a2b2a; color:var(--good); border:1px solid var(--good); font-weight:600; }
+  .status.err { background:#2b0a0a; color:var(--bad);  border:1px solid var(--bad);  font-weight:600; }
+  .meta { background:#0f1630; border:1px solid #1f2747; border-radius:8px; padding:12px; font-size:12px; color:var(--muted); }
+  .meta b { color:var(--text); }
+</style></head><body>
+<header><a href="/">← Terminal</a><h1>Settings</h1><span style="width:60px"></span></header>
+<main>
+  <div>
+    <label for="acquirer">Acquirer API key (X-API-Key for /api/authorize)</label>
+    <input id="acquirer" class="mono" type="text" placeholder="sk_..." autocomplete="off" spellcheck="false">
+    <div class="help">The terminal sends this on every charge. Use the bank that should appear as the acquirer (typically <i>Instructor Bank</i>). Saved to <code id="path"></code>.</div>
+  </div>
+  <div class="row">
+    <button class="primary" id="save" onclick="save()">Save</button>
+    <button class="ghost" onclick="clearKey()">Clear</button>
+  </div>
+  <div id="status" class="status"></div>
+  <div class="meta" id="meta">loading…</div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+function escape(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function setStatus(kind, html){ const s = $('status'); s.className = 'status' + (kind ? ' show '+kind : ''); s.innerHTML = html; }
+
+async function load(){
+  try {
+    const r = await fetch('/config/state');
+    const s = await r.json();
+    $('acquirer').value = s.acquirer_api_key || '';
+    $('path').textContent = s.config_path;
+    const src = s.source === 'config' ? 'saved in config' : (s.source === 'env' ? 'from ACQUIRER_API_KEY env var' : 'unset');
+    $('meta').innerHTML =
+      '<b>Network:</b> ' + escape(s.payment_network_url) + '<br>' +
+      '<b>Authorize:</b> ' + escape(s.authorize_url) + '<br>' +
+      '<b>Register card:</b> ' + escape(s.register_card_url) + '<br>' +
+      '<b>Current key source:</b> ' + escape(src);
+  } catch (e) { setStatus('err', escape(e.message)); }
+}
+
+async function save(){
+  const key = $('acquirer').value.trim();
+  $('save').disabled = true;
+  try {
+    const r = await fetch('/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ acquirer_api_key: key })
+    });
+    const body = await r.json();
+    if (!r.ok) { setStatus('err', escape(body.error || r.status)); return; }
+    setStatus('ok', 'Saved.');
+    load();
+  } catch (e) { setStatus('err', escape(e.message)); }
+  finally { $('save').disabled = false; }
+}
+
+async function clearKey(){
+  $('acquirer').value = '';
+  await save();
+}
+
+load();
 </script></body></html>
 """
 
@@ -554,14 +777,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        elif self.path == "/config":
+            data = CONFIG_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == "/config/state":
+            cfg = load_config()
+            cfg_key = cfg.get("acquirer_api_key") or ""
+            env_key = os.environ.get("ACQUIRER_API_KEY") or ""
+            effective = cfg_key.strip() or env_key
+            source = "config" if cfg_key.strip() else ("env" if env_key else "unset")
+            self._reply(200, {
+                "acquirer_api_key": effective,
+                "source": source,
+                "payment_network_url": PAYMENT_NETWORK_URL,
+                "authorize_url": AUTHORIZE_URL,
+                "register_card_url": REGISTER_CARD_URL,
+                "config_path": CONFIG_PATH,
+            })
         elif self.path == "/readers":
             rs = [str(r) for r in list_readers_safe()]
             self._reply(200, {"readers": rs, "selected": SELECTED_READER_INDEX})
+        elif self.path == "/program/state":
+            cfg = load_config()
+            self._reply(200, {
+                "last_bank_id": cfg.get("last_bank_id", ""),
+                "default_amount": cfg.get("default_amount", 10),
+                "issuer_api_keys": cfg.get("issuer_api_keys", {}),
+            })
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):  # noqa: N802
+        if self.path == "/config":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length).decode() or "{}")
+            except json.JSONDecodeError:
+                self._reply(400, {"error": "invalid json"})
+                return
+            key = (body.get("acquirer_api_key") or "").strip()
+            cfg = load_config()
+            if key:
+                cfg["acquirer_api_key"] = key
+            else:
+                cfg.pop("acquirer_api_key", None)
+            try:
+                save_config(cfg)
+            except OSError as e:
+                self._reply(500, {"error": f"could not save config: {e}"})
+                return
+            print(f"[config] acquirer_api_key {'set' if key else 'cleared'}")
+            self._reply(200, {"status": "ok", "acquirer_api_key": key})
+            return
+
         if self.path == "/reader":
             global SELECTED_READER_INDEX
             length = int(self.headers.get("Content-Length", "0"))
@@ -590,22 +863,102 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             bank_id = (body.get("bank_id") or "").strip()
             account_number = (body.get("account_number") or "").strip()
+            issuer_api_key = (body.get("issuer_api_key") or "").strip()
+            amount = body.get("amount")
             if not re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", bank_id):
-                self._reply(400, {"error": "bank_id must be a UUID"})
+                self._reply(400, {"error": "bank_id must be a UUID", "stage": "validation"})
                 return
             if not re.match(r"^\d{1,16}$", account_number):
-                self._reply(400, {"error": "account_number must be up to 16 digits"})
+                self._reply(400, {"error": "account_number must be up to 16 digits", "stage": "validation"})
+                return
+            if not issuer_api_key:
+                self._reply(400, {"error": "issuer_api_key is required", "stage": "validation"})
+                return
+            if not isinstance(amount, (int, float)) or amount <= 0 or amount > 10:
+                self._reply(400, {"error": "amount must be £0.01–£10", "stage": "validation"})
                 return
             account_number = account_number.zfill(16)
             payload = f"{bank_id}|{account_number}"
+
+            # Step 0: verify the issuer api_key actually belongs to the bank
+            # the user pasted. Otherwise we'd register on bank-of-key while
+            # writing the tag with bank_id, and every charge would 14-decline.
+            who_status, who_body = _whoami_on_network(issuer_api_key)
+            if who_status != 200:
+                self._reply(401, {
+                    "error": who_body.get("error") or f"could not verify issuer api_key (HTTP {who_status})",
+                    "stage": "verify_issuer",
+                    "whoami_status": who_status,
+                })
+                return
+            actual_bank_id = who_body.get("id")
+            if actual_bank_id != bank_id:
+                self._reply(400, {
+                    "error": (
+                        f"issuer_api_key belongs to bank {actual_bank_id} "
+                        f"({who_body.get('name')!r}), not the pasted bank {bank_id}. "
+                        "Paste the matching bank, or supply the correct bank's api_key."
+                    ),
+                    "stage": "verify_issuer",
+                    "expected_bank_id": bank_id,
+                    "actual_bank_id": actual_bank_id,
+                    "actual_bank_name": who_body.get("name"),
+                })
+                return
+
+            # Step 1: register the card on the issuing bank (v2 has no auto-issue).
+            # 201 = newly registered. 409 = already registered → keep going so the
+            # tag still gets written. Anything else aborts before we touch NFC.
+            reg_status, reg_body = _register_card_on_network(issuer_api_key, account_number, float(amount))
+            already = False
+            if reg_status == 201:
+                print(f"[program] registered: {reg_body}")
+            elif reg_status == 409:
+                already = True
+                print(f"[program] card already registered, continuing to write tag")
+            else:
+                print(f"[program] register failed: {reg_status} {reg_body}")
+                self._reply(reg_status if 400 <= reg_status < 600 else 502, {
+                    "error": reg_body.get("error") or f"register failed (HTTP {reg_status})",
+                    "stage": "register",
+                    "register_status": reg_status,
+                    "register_body": reg_body,
+                })
+                return
+
+            # Step 2: write the NFC tag.
             print(f"[program] arming reader, payload={payload} ...")
             verified, err = wait_for_program(payload, TAP_TIMEOUT)
             if err:
-                print(f"[program] failed: {err}")
-                self._reply(400, {"error": err})
+                print(f"[program] tag write failed: {err}")
+                self._reply(400, {
+                    "error": err,
+                    "stage": "tag_write",
+                    "registration": {"already": already, "status": reg_status, "body": reg_body},
+                })
                 return
             print(f"[program] wrote and verified: {verified}")
-            self._reply(200, {"verified": verified, "payload": payload})
+
+            # Step 3: persist for next run. Cache api_key by bank_id so a future
+            # paste of the same bank fills the key in.
+            cfg = load_config()
+            cfg["last_bank_id"] = bank_id
+            cfg["default_amount"] = float(amount)
+            keys = cfg.get("issuer_api_keys")
+            if not isinstance(keys, dict):
+                keys = {}
+            keys[bank_id] = issuer_api_key
+            cfg["issuer_api_keys"] = keys
+            try:
+                save_config(cfg)
+            except OSError as e:
+                print(f"[program] warn: could not save config: {e}")
+
+            self._reply(200, {
+                "verified": verified,
+                "payload": payload,
+                "registration": {"already": already, "status": reg_status, "body": reg_body},
+            })
             return
 
         if self.path != "/charge":
@@ -651,10 +1004,14 @@ def main() -> None:
     else:
         for i, r in enumerate(rs):
             print(f"Reader {i}: {r}{' (selected)' if i == SELECTED_READER_INDEX else ''}")
-    print(f"Remote terminal: {TERMINAL_URL}")
-    if not ADMIN_KEY:
-        print("WARNING: ADMIN_KEY env var not set. The remote endpoint may reject calls.")
-        print("         Set it via: ADMIN_KEY=<your-pw> python local-terminal.py")
+    print(f"Payment network: {PAYMENT_NETWORK_URL}")
+    print(f"  authorize:     {AUTHORIZE_URL}")
+    print(f"  register card: {REGISTER_CARD_URL}")
+    if not current_acquirer_api_key():
+        print("WARNING: no acquirer api_key set. /api/authorize will reject calls.")
+        print("         Set it in the Settings page (http://localhost:%d/config)" % LISTEN_PORT)
+        print("         or via: ACQUIRER_API_KEY=sk_... python local-terminal.py")
+    print(f"Config file:     {CONFIG_PATH}")
     addr = ("127.0.0.1", LISTEN_PORT)
     print(f"\nServing UI on http://{addr[0]}:{addr[1]}  (Ctrl-C to stop)\n")
     ReusableTCPServer(addr, Handler).serve_forever()

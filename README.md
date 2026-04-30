@@ -38,16 +38,18 @@ That's it.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `TERMINAL_URL` | `https://bu-banking-cf.pages.dev/api/terminal/charge` | Where to POST the charge |
-| `ADMIN_KEY` | `dupachuj` | HTTP Basic Auth password for the terminal endpoint |
+| `PAYMENT_NETWORK_URL` | `https://paymentsystem-cards-cf.pages.dev` | v2 network base URL. `/api/authorize` and `/api/cards/register` are derived from this. |
+| `ACQUIRER_API_KEY` | _(unset)_ | `X-API-Key` for the acquiring bank used on `/api/authorize`. **Required** for charges. |
 | `PORT` | `47823` | Local HTTP listen port |
 | `TAP_TIMEOUT` | `30` | Seconds to wait for a tap after clicking the button |
 
 Override on the command line, e.g.:
 
 ```bash
-PORT=8765 ADMIN_KEY=hunter2 python local-terminal.py
+ACQUIRER_API_KEY=sk_... PORT=8765 python local-terminal.py
 ```
+
+Persisted state lives at `~/.bu-banking-terminal/config.json` — last bank_id, default card amount, and issuer api_keys keyed by bank_id (so the Program page can pre-fill the key when you paste a known bank).
 
 ## What's where
 
